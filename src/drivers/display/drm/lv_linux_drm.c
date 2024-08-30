@@ -67,11 +67,8 @@ typedef struct {
     drmModePropertyPtr plane_props[128];
     drmModePropertyPtr crtc_props[128];
     drmModePropertyPtr conn_props[128];
-    drm_buffer_t drm_bufs[2]; /*DUMB buffers*/
-    int drm_buf2;
-    uint8_t * direct_render_buf;
-    uint8_t * rotated_buf;
-    size_t rotated_buf_size;
+    drm_buffer_t drm_buf;
+    uint8_t * lvgl_buf;
 } drm_dev_t;
 
 /**********************
@@ -159,14 +156,13 @@ void lv_linux_drm_set_file(lv_display_t * disp, const char * file, int64_t conne
     int32_t ver_res = drm_dev->height;
     int32_t width = drm_dev->mmWidth;
 
-    size_t buf_size = LV_MIN(drm_dev->drm_bufs[1].size, drm_dev->drm_bufs[0].size);
-    drm_dev->direct_render_buf = lv_malloc(buf_size);
+    drm_dev->lvgl_buf = lv_malloc(drm_dev->drm_buf.size);
 
     /* Resolution must be set first because if the screen is smaller than the size passed
      * to lv_display_create then the buffers aren't big enough for LV_DISPLAY_RENDER_MODE_DIRECT.
      */
     lv_display_set_resolution(disp, hor_res, ver_res);
-    lv_display_set_buffers(disp, drm_dev->direct_render_buf, NULL, buf_size,
+    lv_display_set_buffers(disp, drm_dev->lvgl_buf, NULL, drm_dev->drm_buf.size,
                            LV_DISPLAY_RENDER_MODE_DIRECT);
 
     if(width) {
@@ -402,6 +398,21 @@ static int drm_dmabuf_set_plane(drm_dev_t * drm_dev, drm_buffer_t * buf)
     return 0;
 }
 
+static int drm_dmabuf_flush(drm_dev_t * drm_dev)
+{
+    int ret;
+    uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
+
+    ret = drmModeAtomicCommit(drm_dev->fd, drm_dev->req, flags, drm_dev);
+    if(ret) {
+        LV_LOG_ERROR("drmModeAtomicCommit failed: %s (%d)", strerror(errno), errno);
+        drmModeAtomicFree(drm_dev->req);
+        return ret;
+    }
+
+    return 0;
+}
+
 static int find_plane(drm_dev_t * drm_dev, unsigned int fourcc, uint32_t * plane_id, uint32_t crtc_id,
                       uint32_t crtc_idx)
 {
@@ -527,10 +538,10 @@ static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id)
 
     drm_dev->width = conn->modes[0].hdisplay;
     drm_dev->height = conn->modes[0].vdisplay;
-    if (drm_dev->width % 32 != 0) {
+    if(drm_dev->width % 32 != 0) {
         drm_dev->width = (drm_dev->width + 32) & (~31);
     }
-    if (drm_dev->height % 32 != 0) {
+    if(drm_dev->height % 32 != 0) {
         drm_dev->height = (drm_dev->height + 32) & (~31);
     }
 
@@ -796,15 +807,11 @@ static int drm_setup_buffers(drm_dev_t * drm_dev)
     int ret;
 
     /*Allocate DUMB buffers*/
-    ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_bufs[0]);
+    ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_buf);
     if(ret)
         return ret;
 
-    ret = drm_allocate_dumb(drm_dev, &drm_dev->drm_bufs[1]);
-    if(ret)
-        return ret;
-
-    return 0;
+    return drm_dmabuf_set_plane(drm_dev, &drm_dev->drm_buf);
 }
 
 static void drm_flush_wait(lv_display_t * disp)
@@ -840,39 +847,20 @@ static void drm_flush(lv_display_t * disp, const lv_area_t * area, uint8_t * px_
 
     {
         {
-            // TODO rotate in place and remove use of drm_dev->rotated_buf
+            /* Rotate the pixel buffer */
             lv_color_format_t cf = lv_display_get_color_format(disp);
-            uint32_t px_size = lv_color_format_get_size(cf);
             lv_display_rotation_t rotation = lv_display_get_rotation(disp);
 
             int32_t w = disp->ver_res;
             int32_t h = disp->hor_res;
 
-            /* (Re)allocate temporary buffer if needed */
-            size_t buf_size = w * h * px_size;
-            if(!drm_dev->rotated_buf || drm_dev->rotated_buf_size != buf_size) {
-                drm_dev->rotated_buf = realloc(drm_dev->rotated_buf, buf_size);
-                drm_dev->rotated_buf_size = buf_size;
-            }
-
-            /* Rotate the pixel buffer */
             uint32_t w_stride = lv_draw_buf_width_to_stride(w, cf);
             uint32_t h_stride = lv_draw_buf_width_to_stride(h, cf);
 
-            lv_draw_sw_rotate(px_map, drm_dev->rotated_buf, w, h, w_stride, h_stride, rotation, cf);
-
-            int idx;
-            if (drm_dev->drm_buf2 == 0) {
-                idx = 0;
-                drm_dev->drm_buf2 = 1;
-            } else {
-                idx = 1;
-                drm_dev->drm_buf2 = 0;
-            }
-            lv_memcpy(drm_dev->drm_bufs[idx].map, drm_dev->rotated_buf, buf_size);
+            lv_draw_sw_rotate(px_map, drm_dev->drm_buf.map, w, h, w_stride, h_stride, rotation, cf);
 
             /*Request buffer swap*/
-            if(drm_dmabuf_set_plane(drm_dev, &drm_dev->drm_bufs[idx])) {
+            if(drm_dmabuf_flush(drm_dev)) {
                 LV_LOG_ERROR("Flush fail");
                 return;
             }
