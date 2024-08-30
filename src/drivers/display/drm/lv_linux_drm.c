@@ -525,8 +525,14 @@ static int drm_find_connector(drm_dev_t * drm_dev, int64_t connector_id)
         goto free_res;
     }
 
-    drm_dev->width = conn->modes[0].hdisplay + 40;
+    drm_dev->width = conn->modes[0].hdisplay;
     drm_dev->height = conn->modes[0].vdisplay;
+    if (drm_dev->width % 32 != 0) {
+        drm_dev->width = (drm_dev->width + 32) & (~31);
+    }
+    if (drm_dev->height % 32 != 0) {
+        drm_dev->height = (drm_dev->height + 32) & (~31);
+    }
 
     for(i = 0 ; i < res->count_encoders; i++) {
         enc = drmModeGetEncoder(drm_dev->fd, res->encoders[i]);
